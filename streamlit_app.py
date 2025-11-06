@@ -3,12 +3,13 @@
 # RivalLens Mini — SEO Automation Flow (Beautiful Streamlit UI)
 # ---------------------------------------------------------------
 # 1) Input up to 10 URLs
-# 2) Fetch & parse content + scrape real H1/H2, title, meta description
-# 3) Extract keywords (prefer multi-grams; drop junk like "can")
-# 4) Pull user Qs (Reddit/Quora via SerpAPI)
-# 5) Generate AI FAQ answers (OpenAI); fill meta only if missing
+# 2) Fetch & parse content (cached + parallel)
+# 3) Extract keywords (prefer multi-grams; filter junk)
+# 4) Pull user Qs (Reddit/Quora via SerpAPI) — optional & rate-limited
+# 5) Generate AI FAQ answers (OpenAI)
 # 6) Recommend internal links across URLs
 # 7) Pretty UI + export
+# 8) ⚡ Fast mode, caching, and limited SerpAPI calls for speed
 # ---------------------------------------------------------------
 
 import os
@@ -19,6 +20,7 @@ import html
 import textwrap
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
@@ -39,6 +41,10 @@ MAX_URLS = 10
 DEFAULT_FAQ_COUNT = 5
 USER_QUESTION_SOURCES = ["reddit.com", "quora.com"]
 
+# Speed/limits
+TEXT_TRIM_CHARS = 60000   # trim very long pages for faster n-grams/TF-IDF
+FETCH_TTL = 60 * 60       # cache HTTP/SerpAPI for 1 hour
+
 STOPWORDS = set(
     """
     a about above after again against all am an and any are aren't as at be because been before being below between both
@@ -53,12 +59,10 @@ STOPWORDS = set(
     """.split()
 )
 
-# Extra stopwords/verbs not useful as keywords
+# Extra stopwords / verbs / fillers we don't want as keywords
 EXTRA_STOPWORDS = {
-    "can", "could", "should", "would", "may", "might", "must", "also", "etc", "vs", "—", "–",
-    "use", "using", "used", "based", "make", "made", "making", "get", "got", "getting",
-    # Generic terms you might want to drop (remove from this set if you want them)
-    "report", "reports"
+    "can","could","should","would","may","might","must","also","etc","vs","—","–",
+    "use","using","used","based","make","made","making","get","got","getting",
 }
 STOPWORDS |= EXTRA_STOPWORDS
 
@@ -68,13 +72,13 @@ STOPWORDS |= EXTRA_STOPWORDS
 @dataclass
 class PageData:
     url: str
-    title: str              # <title> tag (or fallback)
-    text: str               # visible text
-    keywords: List[str]     # extracted keywords (primary first)
-    questions: List[str]    # scraped from Reddit/Quora via SerpAPI
+    title: str
+    text: str
+    keywords: List[str]
+    questions: List[str]
     ai_faqs: List[Dict[str, str]]  # {question, answer}
     meta: Dict[str, str]            # {title, description, keywords}
-    headings: Dict[str, List[str]]  # {h1: [...], h2: [...]}
+    headings: Dict[str, List[str]]  # {h1: [..], h2: [..]}
     inner_links: List[Dict[str, str]]  # {source_url, anchor_text, target_url, reason}
 
 # -------------------------
@@ -99,10 +103,26 @@ def section_title(title: str, subtitle: Optional[str] = None):
         )
 
 # -------------------------
-# Fetch & Parse (with structured scraping)
+# Cache helpers
 # -------------------------
-def fetch_page_structured(url: str, timeout: int = 20) -> Tuple[str, str, Dict[str, any]]:
-    """Return (title_tag_text, visible_text, meta/headings dict scraped from HTML)."""
+@st.cache_data(show_spinner=False, ttl=FETCH_TTL)
+def cached_get(url: str, headers: Dict[str, str], timeout: int) -> str:
+    return requests.get(url, headers=headers, timeout=timeout).text
+
+@st.cache_data(show_spinner=False, ttl=FETCH_TTL)
+def cached_serpapi(params_tuple: tuple) -> List[Dict]:
+    url = "https://serpapi.com/search.json"
+    params = dict(params_tuple)
+    r = requests.get(url, params=params, timeout=15)
+    if r.status_code == 200:
+        return r.json().get("organic_results", [])
+    return []
+
+# -------------------------
+# Core: Fetch & Parse
+# -------------------------
+def fetch_page(url: str, timeout: int = 15) -> Tuple[str, str]:
+    """Return (title, visible_text) for a URL. Uses cache + trims long text."""
     try:
         headers = {
             "User-Agent": (
@@ -111,61 +131,36 @@ def fetch_page_structured(url: str, timeout: int = 20) -> Tuple[str, str, Dict[s
                 "Chrome/120.0.0.0 Safari/537.36 RivalLensMini/1.0"
             )
         }
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Remove noise
+        html_text = cached_get(url, headers, timeout)
+        # Prefer lxml if available for speed
+        try:
+            soup = BeautifulSoup(html_text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html_text, "html.parser")
+        page_title = soup.title.text.strip() if soup.title else url
         for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
             tag.decompose()
-
-        # Title tag
-        title_tag = soup.title.text.strip() if soup.title else url
-
-        # Meta description + OpenGraph fallbacks
-        def _meta(name):
-            el = soup.find("meta", attrs={"name": name})
-            return (el.get("content") or "").strip() if el and el.get("content") else ""
-
-        def _meta_prop(prop):
-            el = soup.find("meta", attrs={"property": prop})
-            return (el.get("content") or "").strip() if el and el.get("content") else ""
-
-        meta_title = _meta("title") or _meta_prop("og:title") or title_tag
-        meta_desc  = _meta("description") or _meta_prop("og:description") or ""
-
-        # Headings
-        h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
-        h2s = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
-
-        # Visible text (simple)
         text = " ".join(t.get_text(separator=" ", strip=True) for t in soup.find_all())
         text = re.sub(r"\s+", " ", text)
-
-        meta_head = {
-            "title_tag": title_tag,
-            "meta_title": meta_title,
-            "meta_description": meta_desc,
-            "h1": [h for h in h1s if h],
-            "h2": [h for h in h2s if h],
-        }
-        return title_tag[:200], text, meta_head
+        if len(text) > TEXT_TRIM_CHARS:
+            text = text[:TEXT_TRIM_CHARS]
+        return page_title[:200], text
     except Exception:
-        return url, "", {"title_tag": url, "meta_title": url, "meta_description": "", "h1": [], "h2": []}
+        return url, ""
 
 # -------------------------
 # Keyword Extraction (prefer multi-grams; filter junk)
 # -------------------------
 def extract_keywords_basic(text: str, top_k: int = 12) -> List[str]:
-    text = text.lower()
+    text = text.lower()[:TEXT_TRIM_CHARS]
     tokens = re.findall(r"[a-z][a-z\-]+", text)
     tokens = [t for t in tokens if t not in STOPWORDS and len(t) > 2]
 
-    # Build n-grams (3,2,1) so we prefer multi-grams
+    # Build n-grams preferring multi-grams (3,2,1)
     grams: List[str] = []
     for n in [3, 2, 1]:
         for i in range(len(tokens) - n + 1):
-            grams.append(" ".join(tokens[i:i+n]))
+            grams.append(" ".join(tokens[i : i + n]))
 
     # Frequency with filtering (skip grams containing stopwords)
     freq: Dict[str, int] = {}
@@ -183,7 +178,7 @@ def extract_keywords_basic(text: str, top_k: int = 12) -> List[str]:
         scored.append((k, v * bonus))
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # De-duplicate (keep longest/informative)
+    # De-duplicate, keep most informative
     selected: List[str] = []
     for k, _ in scored:
         if any(k in s or s in k for s in selected):
@@ -192,7 +187,7 @@ def extract_keywords_basic(text: str, top_k: int = 12) -> List[str]:
         if len(selected) >= top_k:
             break
 
-    # Ensure primary is a multi-gram if possible
+    # Ensure primary is multi-gram if possible
     multi = [s for s in selected if len(s.split()) >= 2]
     if multi:
         primary = multi[0]
@@ -201,44 +196,53 @@ def extract_keywords_basic(text: str, top_k: int = 12) -> List[str]:
     return selected
 
 # -------------------------
-# User Questions via SerpAPI
+# User Questions via SerpAPI (Google) — fast & limited
 # -------------------------
 def search_questions_serpapi(query: str, serpapi_key: str, engine: str = "google", num: int = 10) -> List[Dict]:
     if not serpapi_key:
         return []
+    params_tuple = tuple(sorted({
+        "engine": engine,
+        "q": query,
+        "num": num,
+        "api_key": serpapi_key,
+        "hl": "en",
+        "safe": "active",
+    }.items()))
     try:
-        url = "https://serpapi.com/search.json"
-        params = {"engine": engine, "q": query, "num": num, "api_key": serpapi_key, "hl": "en", "safe": "active"}
-        r = requests.get(url, params=params, timeout=30)
-        return r.json().get("organic_results", []) if r.status_code == 200 else []
+        return cached_serpapi(params_tuple)
     except Exception:
         return []
 
-def collect_user_questions(keywords: List[str], serpapi_key: str, per_source: int = 5) -> List[str]:
+def collect_user_questions(keywords: List[str], serpapi_key: str, per_source: int = 5,
+                           skip: bool = False, max_queries: int = 4) -> List[str]:
+    """Find authentic questions from Reddit/Quora searches with fewer API calls."""
+    if skip or not serpapi_key or not keywords:
+        return []
+
+    # Prefer multi-grams; limit keyword pool for speed
+    kw_pool = sorted(keywords[:5], key=lambda k: -len(k.split()))[:2]
+
+    queries: List[str] = []
+    for src in USER_QUESTION_SOURCES:
+        for kw in kw_pool:
+            queries.extend([
+                f"site:{src} {kw} what",
+                f"site:{src} {kw} how",
+                f"site:{src} {kw} best",
+                f"site:{src} {kw} vs",
+            ])
+    queries = queries[:max_queries]
+
     questions: List[str] = []
-    if not keywords:
-        return questions
-
-    base_queries = [
-        q
-        for src in USER_QUESTION_SOURCES
-        for kw in keywords[:3]
-        for q in [
-            f"site:{src} {kw} what",
-            f"site:{src} {kw} how",
-            f"site:{src} {kw} best",
-            f"site:{src} {kw} vs",
-        ]
-    ]
-
-    for q in base_queries:
-        results = search_questions_serpapi(q, serpapi_key)
+    for q in queries:
+        results = search_questions_serpapi(q, serpapi_key, num=5 if per_source <= 5 else 10)
         for res in results:
-            title = res.get("title") or ""
+            title = (res.get("title") or "").strip()
             if not title:
                 continue
             title = html.unescape(title)
-            if title.endswith("?") or re.match(r"^(what|how|why|when|which|where|can|does|do)\b", title.strip().lower()):
+            if title.endswith("?") or re.match(r"^(what|how|why|when|which|where|can|does|do)\b", title.lower()):
                 if title not in questions:
                     questions.append(title)
         if len(questions) >= per_source * len(USER_QUESTION_SOURCES):
@@ -251,20 +255,25 @@ def collect_user_questions(keywords: List[str], serpapi_key: str, per_source: in
     return uniq[: per_source * len(USER_QUESTION_SOURCES)]
 
 # -------------------------
-# OpenAI — generation
+# OpenAI — text generation
 # -------------------------
 def generate_with_openai(prompt: str, api_key: str, model: str = "gpt-4o-mini") -> str:
     if not api_key:
         return ""
     try:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.6}
-        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.6,
+        }
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=45)
         data = r.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception:
         return ""
 
+# Demo fallback
 def demo_generate(prompt: str) -> str:
     return textwrap.shorten(
         (
@@ -278,36 +287,33 @@ def demo_generate(prompt: str) -> str:
     )
 
 # -------------------------
-# Internal Links (TF-IDF)
+# Internal Link Recommendations (TF-IDF Similarity)
 # -------------------------
 def recommend_internal_links(pages: List[PageData], top_n: int = 3) -> List[Dict[str, str]]:
     if len(pages) < 2:
         return []
     docs = [p.text for p in pages]
-    tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1, 2), stop_words="english")
+    tfidf = TfidfVectorizer(max_features=4000, ngram_range=(1, 2), stop_words="english")
     X = tfidf.fit_transform(docs)
     sim = cosine_similarity(X)
 
     recs: List[Dict[str, str]] = []
-    for i, _ in enumerate(pages):
-        sims = list(enumerate(sim[i]))
-        sims = [s for s in sims if s[0] != i]
+    for i, src_page in enumerate(pages):
+        sims = [(j, float(sim[i, j])) for j in range(len(pages)) if j != i]
         sims.sort(key=lambda x: x[1], reverse=True)
         for j, score in sims[:top_n]:
             tgt = pages[j]
-            anchor = (pages[i].keywords[:1] or [tgt.title.split("|")[0][:40]])[0]
-            recs.append(
-                {
-                    "source_url": pages[i].url,
-                    "anchor_text": anchor,
-                    "target_url": tgt.url,
-                    "reason": f"High topical similarity ({score:.2f}).",
-                }
-            )
+            anchor = (src_page.keywords[:1] or [tgt.title.split("|")[0][:40]])[0]
+            recs.append({
+                "source_url": src_page.url,
+                "anchor_text": anchor,
+                "target_url": tgt.url,
+                "reason": f"High topical similarity ({score:.2f}).",
+            })
     return recs
 
 # -------------------------
-# AI Orchestration
+# AI Orchestration per Page
 # -------------------------
 def build_ai_prompts(page: PageData) -> Dict[str, str]:
     kw_line = ", ".join(page.keywords[:8])
@@ -332,46 +338,37 @@ Top Keywords: {kw_line}
 
 Return JSON with keys: title, description, keywords.
 """.strip(),
-        # Keep for future AI-suggested headings (we won't overwrite scraped headings)
-        "headings": f"""
-Draft a clean H1 and 6-8 H2s for this topic. Keep H2s actionable and distinct. Return JSON with keys: h1 (string), h2 (array of strings).
-
-Title: {page.title}
-Top Keywords: {kw_line}
-""".strip(),
+        # (Optional) Headings generator is kept but not used to overwrite
     }
     return prompts
 
 def run_ai_generation(page: PageData, api_key: str, model: str, demo_mode: bool = False) -> PageData:
-    prompts = build_ai_prompts(page)
     gen = demo_generate if (demo_mode or not api_key) else (lambda p: generate_with_openai(p, api_key, model))
+    prompts = build_ai_prompts(page)
 
-    # FAQs
+    # FAQs (answers)
     faqs_raw = gen(prompts["faqs"]) or "[]"
     try:
         page.ai_faqs = json.loads(faqs_raw)
     except Exception:
         page.ai_faqs = [{"question": q, "answer": demo_generate("answer")[:200]} for q in page.questions[:DEFAULT_FAQ_COUNT]]
 
-    # Meta: ONLY fill if missing (we scraped meta already)
-    if not page.meta or not page.meta.get("title") or not page.meta.get("description"):
-        meta_raw = gen(prompts["meta"]) or "{}"
-        try:
-            j = json.loads(meta_raw)
+    # Meta (AI — filled if missing)
+    meta_raw = gen(prompts["meta"]) or "{}"
+    try:
+        j = json.loads(meta_raw)
+        page.meta = {
+            "title": j.get("title") or page.meta.get("title") or page.title,
+            "description": j.get("description") or page.meta.get("description") or "",
+            "keywords": j.get("keywords") or page.meta.get("keywords") or ", ".join(page.keywords[:8]),
+        }
+    except Exception:
+        if not page.meta:
             page.meta = {
-                "title": j.get("title") or page.meta.get("title") or page.title,
-                "description": j.get("description") or page.meta.get("description") or "",
-                "keywords": j.get("keywords") or page.meta.get("keywords") or ", ".join(page.keywords[:8]),
+                "title": page.title[:58],
+                "description": demo_generate("meta description")[:150],
+                "keywords": ", ".join(page.keywords[:8]),
             }
-        except Exception:
-            if not page.meta:
-                page.meta = {
-                    "title": page.title[:58],
-                    "description": demo_generate("meta description")[:150],
-                    "keywords": ", ".join(page.keywords[:8]),
-                }
-
-    # Headings: DO NOT overwrite scraped headings
     return page
 
 # -------------------------
@@ -391,32 +388,36 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # --- SIDEBAR (one block only) ---
+    # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
         badge("Tip: You can run in demo mode without keys")
 
-        # Prefill from env/Secrets if present
+        # Defaults from env/Secrets
         default_openai = os.getenv("OPENAI_API_KEY", "")
         default_serpapi = os.getenv("SERPAPI_KEY", "")
 
-        openai_key_input = st.text_input("OpenAI API Key", type="password", value=default_openai)
-        serpapi_key_input = st.text_input("SerpAPI Key", type="password", value=default_serpapi)
+        openai_key_input = st.text_input("OpenAI API Key (optional)", type="password", value=default_openai)
+        serpapi_key_input = st.text_input("SerpAPI Key (optional)", type="password", value=default_serpapi)
 
         model = st.selectbox("OpenAI Model", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-3.5-turbo"], index=0)
         faq_count = st.slider("# of FAQs", min_value=3, max_value=8, value=DEFAULT_FAQ_COUNT)
 
-        # Effective keys (typed overrides env)
-        effective_openai_key = openai_key_input or default_openai
-        effective_serpapi_key = serpapi_key_input or default_serpapi
+        # Speed toggles
+        fast_mode = st.toggle("⚡ Fast mode (optimize speed)", value=True)
+        skip_serpapi = st.toggle("Skip Reddit/Quora questions (fastest)", value=False)
+        limit_questions = st.slider("Max SerpAPI queries per URL", 2, 12, 4, help="Lower = faster")
 
-        demo_mode = st.toggle("Demo mode (no external calls)", value=(effective_openai_key == ""))
+        # Effective keys
+        openai_key = openai_key_input or default_openai
+        serpapi_key = serpapi_key_input or default_serpapi
 
+        demo_mode = st.toggle("Demo mode (no external calls)", value=(openai_key == ""))
         st.caption("User questions are gathered from Reddit/Quora via Google (SerpAPI)")
         st.divider()
-        st.caption("RivalLens Mini · v1.0")
+        st.caption("RivalLens Mini · v1.1 (fast)")
 
-    # --- MAIN: Input ---
+    # MAIN: Input
     section_title("1) Input URLs", "Add up to 10 URLs — we'll fetch, extract keywords & more")
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -432,8 +433,9 @@ def main():
 
     if fetch_btn:
         raw_urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+        # Unique + limit
         seen = set()
-        urls: List[str] = []
+        urls = []
         for u in raw_urls:
             if u not in seen:
                 seen.add(u)
@@ -451,9 +453,25 @@ def main():
         progress = st.progress(0)
         status = st.empty()
 
+        # 1) Fetch pages in parallel for speed (30% of bar)
+        status.info("Fetching pages…")
+        pages_raw: Dict[str, Tuple[str, str]] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(urls))) as ex:
+            futures = {ex.submit(fetch_page, u): u for u in urls}
+            for n, fut in enumerate(as_completed(futures)):
+                u = futures[fut]
+                try:
+                    title, text = fut.result()
+                except Exception:
+                    title, text = u, ""
+                pages_raw[u] = (title, text)
+                progress.progress(int(((n + 1) / max(1, len(urls))) * 30))
+
+        # 2) Process each page (keywords, questions, AI) sequentially (remaining 70%)
         for idx, url in enumerate(urls):
-            status.info(f"Fetching: {url}")
-            title, text, scraped = fetch_page_structured(url)
+            status.info(f"Analyzing: {url}")
+            title, text = pages_raw.get(url, (url, ""))
+
             if not text:
                 st.error(f"Could not fetch or parse content: {url}")
                 text = ""
@@ -461,7 +479,13 @@ def main():
             kw = extract_keywords_basic(text, top_k=14)
             status.info(f"Extracted keywords for {url}")
 
-            q = collect_user_questions(kw, effective_serpapi_key, per_source=faq_count)
+            q = collect_user_questions(
+                kw,
+                serpapi_key,
+                per_source=faq_count,
+                skip=skip_serpapi,
+                max_queries=(limit_questions if fast_mode else 12),
+            )
             status.info(f"Found {len(q)} authentic user questions for {url}")
 
             page = PageData(
@@ -471,25 +495,19 @@ def main():
                 keywords=kw,
                 questions=q[:faq_count],
                 ai_faqs=[],
-                meta={
-                    "title": scraped.get("meta_title") or title,
-                    "description": scraped.get("meta_description") or "",
-                    "keywords": ", ".join(kw[:8]),
-                },
-                headings={
-                    "h1": scraped.get("h1") or [title],
-                    "h2": scraped.get("h2") or [],
-                },
+                meta={},
+                headings={},
                 inner_links=[],
             )
 
-            status.info(f"Generating AI FAQ answers for {url}")
-            page = run_ai_generation(page, effective_openai_key, model, demo_mode=demo_mode)
+            status.info(f"Generating AI outputs for {url}")
+            page = run_ai_generation(page, openai_key, model, demo_mode=demo_mode)
             pages.append(page)
 
-            progress.progress(int(((idx + 1) / len(urls)) * 100))
-            time.sleep(0.1)
+            progress.progress(30 + int(((idx + 1) / max(1, len(urls))) * 70))
+            time.sleep(0.02 if fast_mode else 0.1)
 
+        # Internal links
         status.info("Calculating internal link recommendations…")
         cross_links = recommend_internal_links(pages, top_n=3)
         for p in pages:
@@ -507,7 +525,6 @@ def main():
                 # Primary + chips
                 primary_kw = p.keywords[0] if p.keywords else ""
                 other_kws = [k for k in p.keywords[1:10]]
-
                 st.markdown("**Primary keyword:** " + (f"`{primary_kw}`" if primary_kw else "_n/a_"))
                 chips = " ".join(
                     [
@@ -522,8 +539,8 @@ def main():
                 with t1:
                     if p.questions:
                         st.markdown("**Top user questions (from Reddit/Quora searches):**")
-                        for q_text in p.questions:
-                            st.markdown(f"- {q_text}")
+                        for q_ in p.questions:
+                            st.markdown(f"- {q_}")
                     else:
                         st.info("No questions found. Try adding a SerpAPI key or adjust keywords.")
 
@@ -535,15 +552,15 @@ def main():
                             st.markdown(f"**Q:** {item.get('question','')}\n\n**A:** {item.get('answer','')}")
 
                 with t2:
-                    st.markdown("#### Scraped Title & Meta")
-                    st.write({
-                        "title_tag": p.title,
-                        "meta_title": p.meta.get("title",""),
-                        "meta_description": p.meta.get("description",""),
-                    })
+                    meta = p.meta or {}
+                    st.markdown("#### Meta (AI-generated)")
+                    st.write({k: meta.get(k, "") for k in ["title", "description", "keywords"]})
 
-                    st.markdown("#### Scraped Headings")
-                    st.write({"H1 (page)": p.headings.get("h1", []), "H2 (page)": p.headings.get("h2", [])})
+                    st.markdown("#### Headings (not scraped in this build)")
+                    if p.headings:
+                        st.write({"H1": p.headings.get("h1", []), "H2": p.headings.get("h2", [])})
+                    else:
+                        st.info("Headings not generated in this version.")
 
                 with t3:
                     if p.inner_links:
@@ -562,8 +579,8 @@ def main():
         all_rows: List[Dict[str, str]] = []
         for p in pages:
             faq_flat = json.dumps(p.ai_faqs, ensure_ascii=False)
-            h1 = (p.headings.get("h1", [""]) or [""])[0]
-            h2 = p.headings.get("h2", [])
+            h1 = (p.headings.get("h1", [""]) or [""])[0] if p.headings else ""
+            h2 = p.headings.get("h2", []) if p.headings else []
             recs = p.inner_links
             all_rows.append(
                 {
@@ -596,11 +613,10 @@ def main():
     st.markdown(
         """
         <hr/>
-        <div style="color:#6b7280;font-size:12px">Tip: Add API keys in the sidebar for live AI and question sourcing. Without keys, app runs in demo mode.</div>
+        <div style="color:#6b7280;font-size:12px">Tip: Add API keys in the sidebar for live AI and question sourcing. Use ⚡ Fast mode & Skip questions for speed.</div>
         """,
         unsafe_allow_html=True,
     )
 
 if __name__ == "__main__":
     main()
-
